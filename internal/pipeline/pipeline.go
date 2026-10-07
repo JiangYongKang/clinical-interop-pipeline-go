@@ -39,6 +39,15 @@ func New(st *store.Store, al *audit.Log, log Logger, now func() time.Time) *Pipe
 	return &Pipeline{store: st, audit: al, log: log, now: now}
 }
 
+// SetClock replaces the serving clock (used to make demos/tests deterministic
+// and to replay historical arrivals at specific instants).
+func (p *Pipeline) SetClock(now func() time.Time) {
+	if now == nil {
+		now = time.Now
+	}
+	p.now = now
+}
+
 // Ingest runs parse -> normalize -> store and logs the input id, decision
 // basis and final status. Every failure returns a *domain.RejectError that
 // contains only the caller ref, status and a value-free reason; raw payload

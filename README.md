@@ -1,7 +1,8 @@
 # 临床数据交换链路（本地可运行，无外部依赖）
 
 一条端到端的本地临床数据流水线：接收多版本 **HL7 v2** 消息与 **FHIR 风格** 就诊数据，
-统一成患者 / 就诊 / 检验结果模型，支持乱序、重复、跨版本更新，按调用方权限受控导出，
+统一成患者 / 就诊 / 检验结果模型，支持乱序、重复、跨版本更新，**整批原子提交**、
+**按业务时间点回溯**、**快照一致的分页导出**，按调用方权限受控导出，
 并对所有判定与导出完整留痕。纯 Go 标准库实现，不依赖数据库、网络或任何外部服务。
 
 ## 快速开始
@@ -14,6 +15,8 @@ go test -race ./...
 go test -cover ./...
 
 # 端到端演示：接收 → 标准化 → 幂等存储 → 拒绝路径 → 受控导出 → 审计校验
+#             → 整批原子提交（坏批零落地 / 修正后重发 / 整批去重）
+#             → 时间点回溯（更正前后视图、不可变时间线）→ 分页一致导出
 go run ./cmd/demo
 
 # 同一批数据跑两轮（独立内存库），对比状态序列与最终状态完全一致
@@ -33,12 +36,15 @@ RawDocument（指针字段区分“缺失”与“空值”）
    │  internal/normalize 必填校验、词表统一、消息内去重、版本排序
    ▼
 ChangeSet（canonical Patient/Encounter/Observation + VersionRank）
-   │  internal/store     幂等表 → 新旧判定 → 类型冲突判定 → 字段级合并（单分片锁原子提交）
+   │  internal/store     幂等表 → 新旧判定 → 类型冲突判定 → 字段级合并
+   │                     （单条一把分片锁；整批按分片序号顺序加多把锁，原子提交）
+   │                     只增结论日志：每次成功写入追加一条 revision（永不原地改）
    ▼
-内存分片库（64 分片，按患者 MRN 哈希）
+内存分片库（64 分片，按患者 MRN 哈希）+ append-only 版本日志
    │  internal/export    角色 scope + 患者白名单 + 脱敏边界
+   │                     整页导出 / 冻结快照的分页会话（OpenSession/NextPage）
    ▼
-受控导出结果（普通用途全脱敏 / 审计用途按白名单保留）
+受控导出结果（普通用途全脱敏 / 审计用途按白名单保留 / 按页返回）
 
 每个阶段都写 internal/audit（SHA-256 哈希链，仅含标识，不含原始字段）
 ```
@@ -48,10 +54,10 @@ ChangeSet（canonical Patient/Encounter/Observation + VersionRank）
 | `internal/domain` | 统一模型、`Status` 枚举、唯一错误形态 `RejectError` |
 | `internal/ingest` | HL7 v2 ER7 解析器、FHIR 版本化 Bundle 解析器 |
 | `internal/normalize` | 必填/类型校验、词表映射、消息内去重、版本 rank |
-| `internal/store` | 分片并发、幂等表、新旧版本判定、字段级合并、确定性快照 |
+| `internal/store` | 分片并发、幂等表、新旧版本判定、字段级合并、整批事务（copy-on-write）、只增版本日志、as-of 快照 |
 | `internal/audit` | 仅追加、SHA-256 哈希链、可校验防篡改 |
-| `internal/export` | 角色 scope、患者白名单、脱敏/审计目的边界 |
-| `internal/pipeline` | 编排、结构化日志、统一错误收口 |
+| `internal/export` | 角色 scope、患者白名单、脱敏/审计目的边界、冻结快照分页会话 |
+| `internal/pipeline` | 编排（单条 + 整批）、结构化日志、统一错误收口 |
 
 ## 支持的输入
 
@@ -133,6 +139,72 @@ ChangeSet（canonical Patient/Encounter/Observation + VersionRank）
 - `go test -race` 验证；并发用例覆盖同一患者大量重复投递（仅一条患者记录、
   无丢失更新）与大量不同患者（无丢失插入）。
 
+### 整批原子提交（all-or-nothing）
+
+`Pipeline.IngestBatch([]BatchItem)` / `Store.ApplyBatch([]*ChangeSet, now)` 提供
+"一次交一整批"的用法，语义如下：
+
+- **先全部校验，再整体提交，绝不落半截。** 阶段一先对每条消息做解析与标准化，
+  第一条 `版本不支持 / 必填缺失 / 类型对不上 / 坏 JSON / 未知格式` 即整批拒绝，
+  此时一条数据都没碰；阶段二把全部 ChangeSet 交给存储事务，针对**已提交状态和本批
+  更早的消息**再做幂等 / stale / 类型冲突判定，任一不过同样整批回滚。
+- **锁序保证原子可见。** 一批可跨多个患者（多个分片），事务按**分片序号升序**一次性
+  锁住所有相关分片，幂等锁始终在分片锁之后获取，加锁顺序全局唯一，因此与并发的
+  单条投递之间不可能出现"看到半批"，也不可能死锁。校验在私有 copy-on-write
+  工作副本上进行，回滚只是丢弃副本，已提交字节不受影响。
+- **同批/跨批重放可重复验证。** 消息 ID + 内容摘要相同即 `deduplicated`（含同批内
+  重复）；同 ID 不同内容整批 `conflict`。原样重跑成功过的整批 → 整批去重，结果稳定
+  可复现（见 `TestApplyBatch_ReplayDeterministic` 与
+  `TestIngestBatch_ExactReplayIsDeduplicatedAndRepeats`）。
+- **失败后修正可整批重发，不被上次失败拖住。** 因为失败不登记幂等、不写数据，只改好
+  被拒的那一条再整批重发即全部生效（见
+  `TestIngestBatch_OneBadMessageRejectsEverything` 的"修正后重发"断言）。
+- **审计与日志：** 成功写每条消息一条 allow 事件 + 一条批次汇总 allow；拒绝只写
+  一条批次级 deny（`index`/`size`，无任何资源标识与载荷字段）。
+
+### 历史与按业务时间点回溯（bitemporal as-of）
+
+存储在字段级合并之外，额外维护**只增的结论日志（journal）**：每次成功的新建/更新都向
+对应实体追加一条 revision（含 `Seq`、`ReceivedAt` 到达时间、`BusinessAt` 业务时间、
+`VersionRank`、`WriterMsgID` 与合并后的结论快照）；去重不追加，拒绝不追加。更正与
+撤回（`cancelled` / `entered-in-error`）都是**追加一条新结论，而不是删除旧结论**。
+
+查询：
+
+- `Store.AsOf(at)`：返回截至 `at` 的全库快照；`PatientAt(mrn, at)`：单个患者。
+- `PatientHistory / EncounterHistory / ObservationHistory`：完整修订时间线。
+
+**统一可见性规则（HL7 2.3.1 / 2.5.1 / FHIR R4 完全一致）：** 一条 revision 在
+时点 `at` 可见，当且仅当它**既已到达（`ReceivedAt <= at`）又已生效
+（`BusinessAt <= at`）**；同一实体在可见修订中取**最后一个（`Seq` 最大）**，其先后
+顺序沿用与实时写入完全相同的全序：业务时间 → 线格式版本 rank（2.3.1=10 < 2.5.1=20
+< R4=30）→ 消息 ID 字典序。由此保证：
+
+1. **之后才送到的旧消息不能改写已定历史**：迟到消息到达时间晚于查询点，对该点不可见；
+   它若业务时间更旧，本来也会判 stale，不会落库（见
+   `TestHistory_AsOfLateArrivingOldMessageCannotRewriteHistory`）。
+2. **同一患者同一时点反复查完全一致**：日志只增，旧时点的可见集合永不变化
+   （`TestHistory_SamePointRepeatedlyIdentical`）。
+3. **更正/撤回在时间线上可见先后**：`TestHistory_CorrectionsAndWithdrawalsRemainOnTimeline`
+   验证 preliminary → final → entered-in-error 三版可逐点还原，撤回不抹掉历史。
+4. **早到的未来结论在生效前不可见**：`BusinessAt > at` 的已送达结论在 `at` 点不可见，
+   到业务时点才出现（`TestHistory_FutureBusinessTimeInvisibleUntilEffective`）。
+
+### 分页导出（冻结快照，翻页不漂移）
+
+- `Service.OpenSession(PageRequest)` 开会话时**一次性**完成角色/脱敏/白名单/名单存在性
+  校验，并用当时的 `AsOf(at)`（`At` 零值取当前钟）**冻结整份快照**到内存会话；
+  `NextPage(token)` 只在该冻结视图上推进游标，`CloseSession(token)` 释放。
+- **翻页一致性：** 会话期间即使有并发写入，每一页都来自同一个一致时点视图，页与页之间
+  不漂移；分页以患者为单位（患者与其就诊、结果同页移动），按脱敏伪名稳定排序，页内顺序
+  确定可复现（`TestSession_PagesDoNotDriftUnderConcurrentWrites`、
+  `TestSession_PagesAreStableCompleteAndOrdered`）。
+- **名单式导出整体拒绝：** 请求显式列出患者时，每个 MRN 必须非空、在白名单内、**且在冻结
+  快照中真实存在**；混入不存在的患者或越权患者 → 整请求 `rejected_permission`，不返回
+  任何部分数据（`TestSession_RosterRejectsUnknownAndOutOfScopePatients`）。
+- **拒绝不带原始敏感字段：** 拒绝错误只含调用方 ref、状态与不含数据的原因，审计事件
+  `Resources` 为空，因此连"哪个 MRN 不存在"这种输入标识也不外泄。
+
 ### 处理结果状态
 
 `accepted` · `updated` · `deduplicated` · `conflict` · `stale` ·
@@ -188,10 +260,21 @@ ChangeSet（canonical Patient/Encounter/Observation + VersionRank）
 go vet ./...                 # 静态检查
 go test -race ./...          # 全部单测 + 并发/竞态
 go test -cover ./...         # 覆盖率
+go run ./cmd/demo            # 端到端：单条 → 整批原子提交 → 时间点回溯 → 分页导出
 go run ./cmd/demo -repeat    # 同批两轮，确认状态序列与最终状态一致
 ```
 
-关键测试矩阵：
+新增行为的测试矩阵：
+
+| 业务能力 | 关注的用例 | 位置 |
+|---|---|---|
+| 整批原子性 | 任一坏消息整批拒绝且零落地；同 ID 异内容冲突可重试；原样重放整批去重；并发批次无半批 | `internal/store/batch_test.go` |
+| 整批编排 | 版本/必填/坏 JSON/未知格式整批拒绝；拒绝不泄露；修正后整批重发生效；对已提交状态 stale 整批拒；空批 | `internal/pipeline/batch_test.go` |
+| 时间点回溯 | 迟到旧消息不改写历史；未来业务时间生效前不可见；同点重复查询一致；更正/撤回留在时间线；三版本同点规则统一 | `internal/store/history_test.go` |
+| 回溯端到端 | HL7 2.3.1/2.5.1 + FHIR R4 真实报文乱序到达，跨版本同点取值与时间线 | `internal/pipeline/history_e2e_test.go` |
+| 分页一致性 | 翻页不重不漏、顺序可复现；并发写入下页不漂移；不存在/越权整请求拒；错误与审计不泄露选择器；as-of 冻结 | `internal/export/page_test.go` |
+
+历史（既有）测试矩阵：
 
 | 关注点 | 测试 |
 |---|---|
@@ -201,6 +284,13 @@ go run ./cmd/demo -repeat    # 同批两轮，确认状态序列与最终状态�
 | 权限、脱敏、非法组合、部分失败、错误防泄露 | `internal/export/export_test.go` |
 | 审计哈希链、篡改检测 | `internal/audit/audit_test.go` |
 | 乱序批次重复运行一致性、并发整链 | `internal/pipeline/pipeline_test.go` |
+
+查看覆盖了哪些业务与每个用例的结果：
+
+```bash
+go test -race -v ./...                 # 逐条打印 === RUN / --- PASS|FAIL
+go test -race -v ./... | tee run.log   # 同时留存日志
+```
 
 时钟可注入（`pipeline.New(..., nowFunc)`），演示与测试使用固定时钟，保证
 同一批数据任意时刻、任意投递顺序重复运行都得到一致结果。

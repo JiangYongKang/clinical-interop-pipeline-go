@@ -88,6 +88,10 @@ func runBatch(logger *log.Logger, round int) {
 		fmt.Println("refused:", err)
 	}
 
+	demoBatch(pl, st)
+	demoHistory(pl, st)
+	demoPagination(svc)
+
 	if err := al.Verify(); err != nil {
 		fmt.Println("AUDIT CHAIN INVALID:", err)
 	} else {

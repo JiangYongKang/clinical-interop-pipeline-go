@@ -56,16 +56,25 @@ type shard struct {
 	patientProv  map[string]provenance
 	encProv      map[string]provenance
 	obsProv      map[string]provenance
+
+	// Append-only conclusion journals. Every successful create/update appends
+	// exactly one revision; rejections never append. The stored entity is the
+	// post-merge conclusion, so an as-of view is the last eligible revision.
+	patientRevs map[string][]PatientRevision
+	encRevs     map[string][]EncounterRevision
+	obsRevs     map[string][]ObservationRevision
 }
 
 // Store is a sharded, in-memory, concurrency-safe clinical data store.
-// All entities of one message share one patient MRN, therefore one shard lock
-// serializes every message touching a patient; the global idempotency lock is
-// always taken AFTER the shard lock, which makes deadlocks impossible.
+// All entities of one message share one patient MRN; a batch may span several
+// MRNs, so batch transactions lock every involved shard in ascending index
+// order and always take the global idempotency lock AFTER the shard locks —
+// one global lock order makes deadlocks impossible.
 type Store struct {
 	shards [shardCount]*shard
 	idemMu sync.Mutex
 	idem   map[string]idemRec
+	seq    int64 // global, monotonically increasing revision number
 }
 
 // New builds an empty store.
@@ -79,6 +88,9 @@ func New() *Store {
 			patientProv:  map[string]provenance{},
 			encProv:      map[string]provenance{},
 			obsProv:      map[string]provenance{},
+			patientRevs:  map[string][]PatientRevision{},
+			encRevs:      map[string][]EncounterRevision{},
+			obsRevs:      map[string][]ObservationRevision{},
 		}
 	}
 	return s
@@ -87,117 +99,295 @@ func New() *Store {
 // Apply validates idempotency, performs stale/type-conflict checks and merges
 // field-level updates atomically per message.
 func (s *Store) Apply(cs *normalize.ChangeSet, now time.Time) Outcome {
-	mrn := messageMRN(cs)
-	digest := ContentDigest(cs)
-	out := Outcome{MessageID: cs.MessageID, PatientMRN: mrn, Digest: digest}
-	if mrn == "" {
-		out.Status = domain.StatusRejectedMissingField
-		out.Reason = "message contains no attributable patient"
-		return out
+	outs, _, out := s.applyTx([]*normalize.ChangeSet{cs}, now)
+	if out != nil {
+		return *out
 	}
-	if cs.Encounter != nil {
-		out.VisitID = cs.Encounter.VisitID
+	return outs[0]
+}
+
+// txReject describes why a transaction must abort before committing anything.
+type txReject struct {
+	index  int
+	status domain.Status
+	reason string
+	obsID  string
+}
+
+// shardView is a private, copy-on-write working copy of one shard. Until a
+// candidate actually writes, it aliases the committed maps; the first write
+// clones every map, so an aborted transaction leaves committed bytes untouched.
+type shardView struct {
+	sh           *shard
+	patients     map[string]*domain.Patient
+	encounters   map[string]*domain.Encounter
+	observations map[string]*domain.Observation
+	patientProv  map[string]provenance
+	encProv      map[string]provenance
+	obsProv      map[string]provenance
+	patientRevs  map[string][]PatientRevision
+	encRevs      map[string][]EncounterRevision
+	obsRevs      map[string][]ObservationRevision
+	dirty        bool
+}
+
+func newView(sh *shard) *shardView {
+	return &shardView{
+		sh:           sh,
+		patients:     sh.patients,
+		encounters:   sh.encounters,
+		observations: sh.observations,
+		patientProv:  sh.patientProv,
+		encProv:      sh.encProv,
+		obsProv:      sh.obsProv,
+		patientRevs:  sh.patientRevs,
+		encRevs:      sh.encRevs,
+		obsRevs:      sh.obsRevs,
 	}
+}
 
-	sh := s.shards[shardIndex(mrn)]
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+// touch clones the shard maps once for private mutation.
+func (v *shardView) touch() {
+	if v.dirty {
+		return
+	}
+	v.patients = clonePatientMap(v.sh.patients)
+	v.encounters = cloneEncounterMap(v.sh.encounters)
+	v.observations = cloneObservationMap(v.sh.observations)
+	v.patientProv = cloneProvP(v.sh.patientProv)
+	v.encProv = cloneProvE(v.sh.encProv)
+	v.obsProv = cloneProvO(v.sh.obsProv)
+	v.patientRevs = clonePatientRevMap(v.sh.patientRevs)
+	v.encRevs = cloneEncounterRevMap(v.sh.encRevs)
+	v.obsRevs = cloneObservationRevMap(v.sh.obsRevs)
+	v.dirty = true
+}
 
-	s.idemMu.Lock()
-	if rec, ok := s.idem[cs.MessageID]; ok {
-		s.idemMu.Unlock()
-		if rec.Digest == digest {
-			out.Status = domain.StatusDeduplicated
-			out.Reason = "identical re-delivery of already applied message"
-			return out
+// commit installs the working copies back onto the shard.
+func (v *shardView) commit() {
+	if !v.dirty {
+		return
+	}
+	v.sh.patients = v.patients
+	v.sh.encounters = v.encounters
+	v.sh.observations = v.observations
+	v.sh.patientProv = v.patientProv
+	v.sh.encProv = v.encProv
+	v.sh.obsProv = v.obsProv
+	v.sh.patientRevs = v.patientRevs
+	v.sh.encRevs = v.encRevs
+	v.sh.obsRevs = v.obsRevs
+}
+
+// applyTx runs the validate-then-commit engine shared by single Apply and
+// ApplyBatch. On hard failure it returns a txReject and installs nothing.
+func (s *Store) applyTx(css []*normalize.ChangeSet, now time.Time) ([]Outcome, int, *Outcome) {
+	mrns := make([]string, len(css))
+	for i, cs := range css {
+		mrns[i] = messageMRN(cs)
+		if mrns[i] == "" {
+			o := Outcome{MessageID: safeMsgID(cs), Status: domain.StatusRejectedMissingField,
+				Reason: "message contains no attributable patient"}
+			return nil, i, &o
 		}
-		out.Status = domain.StatusConflict
-		out.Reason = "same message id re-used with different content"
-		return out
 	}
-	s.idemMu.Unlock()
 
-	// All checks below happen under the shard lock; on rejection nothing is
-	// written, so a corrected message can be re-sent later.
-	var basis []string
-	created, updated := 0, 0
+	// Lock every involved shard in one global (ascending) order.
+	idxSet := map[int]bool{}
+	for _, mrn := range mrns {
+		idxSet[int(shardIndex(mrn))] = true
+	}
+	idxs := make([]int, 0, len(idxSet))
+	for i := range idxSet {
+		idxs = append(idxs, i)
+	}
+	sort.Ints(idxs)
+	for _, i := range idxs {
+		s.shards[i].mu.Lock()
+		defer s.shards[i].mu.Unlock()
+	}
+	s.idemMu.Lock()
+	defer s.idemMu.Unlock()
+
+	views := map[int]*shardView{}
+	view := func(mrn string) *shardView {
+		i := int(shardIndex(mrn))
+		v := views[i]
+		if v == nil {
+			v = newView(s.shards[i])
+			views[i] = v
+		}
+		return v
+	}
+	// Working idempotency table: committed entries plus entries staged by
+	// earlier messages of THIS transaction, so in-batch replay is recognized.
+	workIdem := make(map[string]idemRec, len(s.idem))
+	for k, v := range s.idem {
+		workIdem[k] = v
+	}
+
+	outs := make([]Outcome, len(css))
+	created, updated, deduped := 0, 0, 0
+
+	for i, cs := range css {
+		mrn := mrns[i]
+		digest := ContentDigest(cs)
+		out := Outcome{MessageID: cs.MessageID, PatientMRN: mrn, Digest: digest}
+		if cs.Encounter != nil {
+			out.VisitID = cs.Encounter.VisitID
+		}
+		v := view(mrn)
+
+		if rec, ok := workIdem[cs.MessageID]; ok {
+			if rec.Digest == digest {
+				out.Status = domain.StatusDeduplicated
+				out.Reason = "identical re-delivery of already applied message"
+				outs[i] = out
+				deduped++
+				continue
+			}
+			rj := Outcome{MessageID: cs.MessageID, PatientMRN: mrn, Digest: digest,
+				Status: domain.StatusConflict, Reason: "same message id re-used with different content"}
+			return nil, i, &rj
+		}
+
+		// All checks below mutate only private working copies; on rejection
+		// nothing is committed, so a corrected message can be re-sent later.
+		var basis []string
+		itemCreated, itemUpdated := stage(s, v, cs, now, &out, &basis)
+		if out.Status != "" {
+			// hard rejection staged -> abort the whole transaction
+			return nil, i, &out
+		}
+
+		workIdem[cs.MessageID] = idemRec{Digest: digest, MRN: mrn}
+		if itemUpdated > 0 {
+			out.Status = domain.StatusUpdated
+		} else {
+			out.Status = domain.StatusAccepted
+		}
+		created += itemCreated
+		updated += itemUpdated
+		sort.Strings(basis)
+		out.Reason = strings.Join(basis, "; ")
+		outs[i] = out
+	}
+
+	// All messages passed: install working copies and idempotency entries.
+	for _, v := range views {
+		v.commit()
+	}
+	for i, cs := range css {
+		if outs[i].Status == domain.StatusDeduplicated {
+			continue
+		}
+		s.idem[cs.MessageID] = idemRec{Digest: outs[i].Digest, MRN: mrns[i]}
+	}
+	_ = created
+	_ = updated
+	_ = deduped
+	return outs, 0, nil
+}
+
+// stage validates and buffers one message's merges into the shard view. On a
+// hard rejection it sets out.Status/out.Reason and returns. Revisions are
+// appended to the view's private journal slices.
+func stage(s *Store, v *shardView, cs *normalize.ChangeSet, now time.Time,
+	out *Outcome, basis *[]string) (created, updates int) {
 
 	if cs.Patient != nil {
-		if rec, ok := sh.patientProv[mrn]; ok {
+		mrn := cs.Patient.MRN
+		if rec, ok := v.patientProv[mrn]; ok {
 			if !isNewer(cs.Patient.UpdatedAt, cs.Rank, cs.MessageID, rec) {
 				out.Status = domain.StatusStale
 				out.Reason = "patient conclusion is not newer than stored version"
-				return out
+				return 0, 0
 			}
-			mergePatient(sh.patients[mrn], cs.Patient)
-			updated++
-			basis = append(basis, "patient:updated")
+			merged := clonePatient(v.patients[mrn])
+			mergePatient(merged, cs.Patient)
+			v.touch()
+			v.patients[mrn] = merged
+			updates++
+			*basis = append(*basis, "patient:updated")
 		} else {
-			sh.patients[mrn] = clonePatient(cs.Patient)
+			v.touch()
+			v.patients[mrn] = clonePatient(cs.Patient)
 			created++
-			basis = append(basis, "patient:new")
+			*basis = append(*basis, "patient:new")
 		}
-		sh.patientProv[mrn] = provenance{cs.Patient.UpdatedAt, cs.Rank, cs.MessageID}
+		v.patientProv[mrn] = provenance{cs.Patient.UpdatedAt, cs.Rank, cs.MessageID}
+		v.patientRevs[mrn] = append(v.patientRevs[mrn], PatientRevision{
+			Seq: s.nextSeq(), ReceivedAt: now.UTC(), BusinessAt: cs.Patient.UpdatedAt,
+			Rank: cs.Rank, WriterMsgID: cs.MessageID, Patient: clonePatient(v.patients[mrn]),
+		})
 	}
 
 	if cs.Encounter != nil {
 		e := cs.Encounter
-		if prov, ok := sh.encProv[e.VisitID]; ok {
+		if prov, ok := v.encProv[e.VisitID]; ok {
 			if !isNewer(e.UpdatedAt, cs.Rank, cs.MessageID, prov) {
 				out.Status = domain.StatusStale
 				out.Reason = "encounter conclusion is not newer than stored version"
-				return out
+				return created, updates
 			}
-			mergeEncounter(sh.encounters[e.VisitID], e)
-			updated++
-			basis = append(basis, "encounter:updated")
+			merged := cloneEncounter(v.encounters[e.VisitID])
+			mergeEncounter(merged, e)
+			v.touch()
+			v.encounters[e.VisitID] = merged
+			updates++
+			*basis = append(*basis, "encounter:updated")
 		} else {
-			sh.encounters[e.VisitID] = cloneEncounter(e)
+			v.touch()
+			v.encounters[e.VisitID] = cloneEncounter(e)
 			created++
-			basis = append(basis, "encounter:new")
+			*basis = append(*basis, "encounter:new")
 		}
-		sh.encProv[e.VisitID] = provenance{e.UpdatedAt, cs.Rank, cs.MessageID}
+		v.encProv[e.VisitID] = provenance{e.UpdatedAt, cs.Rank, cs.MessageID}
+		v.encRevs[e.VisitID] = append(v.encRevs[e.VisitID], EncounterRevision{
+			Seq: s.nextSeq(), ReceivedAt: now.UTC(), BusinessAt: e.UpdatedAt,
+			Rank: cs.Rank, WriterMsgID: cs.MessageID, Encounter: cloneEncounter(v.encounters[e.VisitID]),
+		})
 	}
 
 	for _, o := range cs.Observations {
-		if ex, ok := sh.observations[o.ObservationID]; ok {
+		if ex, ok := v.observations[o.ObservationID]; ok {
 			if (ex.ValueNumber == nil) != (o.ValueNumber == nil) {
 				out.Status = domain.StatusRejectedTypeConflict
 				out.Reason = "observation value type conflicts with stored value"
 				out.Observation = o.ObservationID
-				return out
+				return created, updates
 			}
-			if prov, ok := sh.obsProv[o.ObservationID]; ok && !isNewer(o.UpdatedAt, cs.Rank, cs.MessageID, prov) {
+			if prov, ok := v.obsProv[o.ObservationID]; ok && !isNewer(o.UpdatedAt, cs.Rank, cs.MessageID, prov) {
 				out.Status = domain.StatusStale
 				out.Reason = "observation conclusion is not newer than stored version"
 				out.Observation = o.ObservationID
-				return out
+				return created, updates
 			}
-			mergeObservation(sh.observations[o.ObservationID], o)
-			updated++
-			basis = append(basis, "observation:"+o.ObservationID+":updated")
+			merged := cloneObservation(v.observations[o.ObservationID])
+			mergeObservation(merged, o)
+			v.touch()
+			v.observations[o.ObservationID] = merged
+			updates++
+			*basis = append(*basis, "observation:"+o.ObservationID+":updated")
 		} else {
-			sh.observations[o.ObservationID] = cloneObservation(o)
+			v.touch()
+			v.observations[o.ObservationID] = cloneObservation(o)
 			created++
-			basis = append(basis, "observation:"+o.ObservationID+":new")
+			*basis = append(*basis, "observation:"+o.ObservationID+":new")
 		}
-		sh.obsProv[o.ObservationID] = provenance{o.UpdatedAt, cs.Rank, cs.MessageID}
+		v.obsProv[o.ObservationID] = provenance{o.UpdatedAt, cs.Rank, cs.MessageID}
+		v.obsRevs[o.ObservationID] = append(v.obsRevs[o.ObservationID], ObservationRevision{
+			Seq: s.nextSeq(), ReceivedAt: now.UTC(), BusinessAt: o.UpdatedAt,
+			Rank: cs.Rank, WriterMsgID: cs.MessageID,
+			Observation: cloneObservation(v.observations[o.ObservationID]),
+		})
 	}
+	return created, updates
+}
 
-	// Commit idempotency only after the whole message merged successfully.
-	s.idemMu.Lock()
-	s.idem[cs.MessageID] = idemRec{Digest: digest, MRN: mrn}
-	s.idemMu.Unlock()
-
-	if updated > 0 {
-		out.Status = domain.StatusUpdated
-	} else {
-		out.Status = domain.StatusAccepted
-	}
-	sort.Strings(basis)
-	out.Reason = strings.Join(basis, "; ")
-	_ = now
-	return out
+func (s *Store) nextSeq() int64 {
+	s.seq++
+	return s.seq
 }
 
 // isNewer decides whether a candidate conclusion may replace the stored one.
@@ -283,15 +473,22 @@ func (s *Store) Snapshot() Snapshot {
 		}
 		sh.mu.Unlock()
 	}
+	sortSnap(&snap)
+	return snap
+}
+
+func sortSnap(snap *Snapshot) {
 	sort.Slice(snap.Patients, func(i, j int) bool { return snap.Patients[i].MRN < snap.Patients[j].MRN })
 	sort.Slice(snap.Encounters, func(i, j int) bool { return snap.Encounters[i].VisitID < snap.Encounters[j].VisitID })
 	sort.Slice(snap.Observations, func(i, j int) bool {
 		return snap.Observations[i].ObservationID < snap.Observations[j].ObservationID
 	})
-	return snap
 }
 
 func messageMRN(cs *normalize.ChangeSet) string {
+	if cs == nil {
+		return ""
+	}
 	if cs.Patient != nil {
 		return cs.Patient.MRN
 	}
@@ -302,6 +499,13 @@ func messageMRN(cs *normalize.ChangeSet) string {
 		return cs.Observations[0].MRN
 	}
 	return ""
+}
+
+func safeMsgID(cs *normalize.ChangeSet) string {
+	if cs == nil {
+		return ""
+	}
+	return cs.MessageID
 }
 
 func shardIndex(key string) uint32 {
@@ -353,4 +557,63 @@ func cloneObservation(o *domain.Observation) *domain.Observation {
 		c.ValueNumber = &n
 	}
 	return &c
+}
+
+func clonePatientMap(m map[string]*domain.Patient) map[string]*domain.Patient {
+	out := make(map[string]*domain.Patient, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneEncounterMap(m map[string]*domain.Encounter) map[string]*domain.Encounter {
+	out := make(map[string]*domain.Encounter, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneObservationMap(m map[string]*domain.Observation) map[string]*domain.Observation {
+	out := make(map[string]*domain.Observation, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneProvP(m map[string]provenance) map[string]provenance {
+	out := make(map[string]provenance, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneProvE(m map[string]provenance) map[string]provenance { return cloneProvP(m) }
+func cloneProvO(m map[string]provenance) map[string]provenance { return cloneProvP(m) }
+
+func clonePatientRevMap(m map[string][]PatientRevision) map[string][]PatientRevision {
+	out := make(map[string][]PatientRevision, len(m))
+	for k, v := range m {
+		out[k] = append([]PatientRevision(nil), v...)
+	}
+	return out
+}
+
+func cloneEncounterRevMap(m map[string][]EncounterRevision) map[string][]EncounterRevision {
+	out := make(map[string][]EncounterRevision, len(m))
+	for k, v := range m {
+		out[k] = append([]EncounterRevision(nil), v...)
+	}
+	return out
+}
+
+func cloneObservationRevMap(m map[string][]ObservationRevision) map[string][]ObservationRevision {
+	out := make(map[string][]ObservationRevision, len(m))
+	for k, v := range m {
+		out[k] = append([]ObservationRevision(nil), v...)
+	}
+	return out
 }

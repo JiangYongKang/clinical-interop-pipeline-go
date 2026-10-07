@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/highcumontoa/clinical-interop-pipeline-go/internal/audit"
@@ -70,6 +71,9 @@ type Service struct {
 	audit  *audit.Log
 	roles  map[string]Role
 	macKey []byte
+
+	sessionsMu sync.RWMutex
+	sessions   map[string]*session
 }
 
 // New builds an export service. macKey salts the pseudonymization HMAC.
@@ -78,7 +82,13 @@ func New(st *store.Store, al *audit.Log, roles []Role, macKey []byte) *Service {
 	for _, r := range roles {
 		rm[r.Name] = r
 	}
-	return &Service{store: st, audit: al, roles: rm, macKey: append([]byte(nil), macKey...)}
+	return &Service{
+		store:    st,
+		audit:    al,
+		roles:    rm,
+		macKey:   append([]byte(nil), macKey...),
+		sessions: map[string]*session{},
+	}
 }
 
 // Export returns data the actor is allowed to see, masked per purpose, and
@@ -141,8 +151,10 @@ func (svc *Service) Export(req Request) (*ResultSet, error) {
 	}
 
 	// Resolve the patient selection and enforce the allow-list atomically:
-	// one out-of-scope MRN rejects the entire request.
-	snap := svc.store.Snapshot()
+	// one out-of-scope MRN rejects the entire request. The view is pinned to
+	// the request instant (AsOf): only conclusions that had arrived and taken
+	// effect by at are visible, so repeated requests at the same at agree.
+	snap := svc.store.AsOf(at)
 	allowedMRNs := map[string]bool{}
 	wildcard := role.AllowedMRNs["*"]
 	if len(req.PatientMRNs) > 0 {
