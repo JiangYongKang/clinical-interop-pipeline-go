@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/highcumontoa/clinical-interop-pipeline-go/internal/audit"
@@ -54,6 +55,7 @@ type Request struct {
 	PatientMRNs    []string // explicit selection; empty means all allowed
 	Ref            string
 	At             time.Time
+	AsOf           time.Time // when non-zero, read the historical as-of view
 }
 
 // ResultSet is a deterministic, ordered export payload.
@@ -70,6 +72,22 @@ type Service struct {
 	audit  *audit.Log
 	roles  map[string]Role
 	macKey []byte
+
+	pageMu sync.Mutex
+	pages  map[string]*pageSession
+}
+
+// pageSession pins one export read to one immutable snapshot, so every page
+// of the read sees the same consistent point-in-time view even while writes
+// continue concurrently. It also binds the caller and masking choice, so a
+// continuation cannot widen access by changing actor/purpose/fields.
+type pageSession struct {
+	actor    string
+	purpose  Purpose
+	unmask   string // sorted list of retained fields
+	viewTime time.Time
+	size     int
+	snapshot store.Snapshot
 }
 
 // New builds an export service. macKey salts the pseudonymization HMAC.
@@ -78,7 +96,7 @@ func New(st *store.Store, al *audit.Log, roles []Role, macKey []byte) *Service {
 	for _, r := range roles {
 		rm[r.Name] = r
 	}
-	return &Service{store: st, audit: al, roles: rm, macKey: append([]byte(nil), macKey...)}
+	return &Service{store: st, audit: al, roles: rm, macKey: append([]byte(nil), macKey...), pages: map[string]*pageSession{}}
 }
 
 // Export returns data the actor is allowed to see, masked per purpose, and
@@ -141,8 +159,14 @@ func (svc *Service) Export(req Request) (*ResultSet, error) {
 	}
 
 	// Resolve the patient selection and enforce the allow-list atomically:
-	// one out-of-scope MRN rejects the entire request.
-	snap := svc.store.Snapshot()
+	// one out-of-scope MRN rejects the entire request. AsOf requests read the
+	// immutable point-in-time view; current requests read the live snapshot.
+	var snap store.Snapshot
+	if !req.AsOf.IsZero() {
+		snap = svc.store.SnapshotAt(req.AsOf, store.HistoryOptions{})
+	} else {
+		snap = svc.store.Snapshot()
+	}
 	allowedMRNs := map[string]bool{}
 	wildcard := role.AllowedMRNs["*"]
 	if len(req.PatientMRNs) > 0 {

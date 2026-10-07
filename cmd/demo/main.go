@@ -70,7 +70,12 @@ func runBatch(logger *log.Logger, round int) {
 		fmt.Printf("[reject] redelivery error: %v\n", rj)
 	}
 
+	// new capabilities: atomic batch, historical reconstruction, paged export
+	runBatchIngestDemo(st, pl, logger)
+	runHistoryDemo()
+
 	svc := export.New(st, al, demoRoles(), []byte("local-demo-mac-key"))
+	runPagedExportDemo(svc)
 
 	fmt.Println("\n--- analytics (normal purpose, masked) ---")
 	showExport(svc, export.Request{Actor: "analytics", Purpose: export.PurposeNormal})

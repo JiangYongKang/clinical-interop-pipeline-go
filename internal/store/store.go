@@ -56,6 +56,11 @@ type shard struct {
 	patientProv  map[string]provenance
 	encProv      map[string]provenance
 	obsProv      map[string]provenance
+	// Append-only winning-write logs per entity. They are the raw material
+	// for as-of reconstruction: every correction or withdrawal stays visible.
+	patRevs map[string][]EntityRevision // keyed by MRN
+	encRevs map[string][]EntityRevision // keyed by VisitID
+	obsRevs map[string][]EntityRevision // keyed by ObservationID
 }
 
 // Store is a sharded, in-memory, concurrency-safe clinical data store.
@@ -63,14 +68,15 @@ type shard struct {
 // serializes every message touching a patient; the global idempotency lock is
 // always taken AFTER the shard lock, which makes deadlocks impossible.
 type Store struct {
-	shards [shardCount]*shard
-	idemMu sync.Mutex
-	idem   map[string]idemRec
+	shards    [shardCount]*shard
+	idemMu    sync.Mutex
+	idem      map[string]idemRec
+	batchIdem map[string]batchRec
 }
 
 // New builds an empty store.
 func New() *Store {
-	s := &Store{idem: make(map[string]idemRec)}
+	s := &Store{idem: make(map[string]idemRec), batchIdem: make(map[string]batchRec)}
 	for i := range s.shards {
 		s.shards[i] = &shard{
 			patients:     map[string]*domain.Patient{},
@@ -79,6 +85,9 @@ func New() *Store {
 			patientProv:  map[string]provenance{},
 			encProv:      map[string]provenance{},
 			obsProv:      map[string]provenance{},
+			patRevs:      map[string][]EntityRevision{},
+			encRevs:      map[string][]EntityRevision{},
+			obsRevs:      map[string][]EntityRevision{},
 		}
 	}
 	return s
@@ -138,6 +147,11 @@ func (s *Store) Apply(cs *normalize.ChangeSet, now time.Time) Outcome {
 			basis = append(basis, "patient:new")
 		}
 		sh.patientProv[mrn] = provenance{cs.Patient.UpdatedAt, cs.Rank, cs.MessageID}
+		sh.patRevs[mrn] = append(sh.patRevs[mrn], EntityRevision{
+			Kind: "patient", ID: mrn, MRN: mrn,
+			UpdatedAt: cs.Patient.UpdatedAt, Rank: cs.Rank, Writer: cs.MessageID,
+			RecordedAt: now, Patient: clonePatient(sh.patients[mrn]),
+		})
 	}
 
 	if cs.Encounter != nil {
@@ -157,6 +171,11 @@ func (s *Store) Apply(cs *normalize.ChangeSet, now time.Time) Outcome {
 			basis = append(basis, "encounter:new")
 		}
 		sh.encProv[e.VisitID] = provenance{e.UpdatedAt, cs.Rank, cs.MessageID}
+		sh.encRevs[e.VisitID] = append(sh.encRevs[e.VisitID], EntityRevision{
+			Kind: "encounter", ID: e.VisitID, MRN: e.MRN,
+			UpdatedAt: e.UpdatedAt, Rank: cs.Rank, Writer: cs.MessageID,
+			RecordedAt: now, Encounter: cloneEncounter(sh.encounters[e.VisitID]),
+		})
 	}
 
 	for _, o := range cs.Observations {
@@ -182,6 +201,11 @@ func (s *Store) Apply(cs *normalize.ChangeSet, now time.Time) Outcome {
 			basis = append(basis, "observation:"+o.ObservationID+":new")
 		}
 		sh.obsProv[o.ObservationID] = provenance{o.UpdatedAt, cs.Rank, cs.MessageID}
+		sh.obsRevs[o.ObservationID] = append(sh.obsRevs[o.ObservationID], EntityRevision{
+			Kind: "observation", ID: o.ObservationID, MRN: o.MRN,
+			UpdatedAt: o.UpdatedAt, Rank: cs.Rank, Writer: cs.MessageID,
+			RecordedAt: now, Observation: cloneObservation(sh.observations[o.ObservationID]),
+		})
 	}
 
 	// Commit idempotency only after the whole message merged successfully.
@@ -196,7 +220,6 @@ func (s *Store) Apply(cs *normalize.ChangeSet, now time.Time) Outcome {
 	}
 	sort.Strings(basis)
 	out.Reason = strings.Join(basis, "; ")
-	_ = now
 	return out
 }
 
